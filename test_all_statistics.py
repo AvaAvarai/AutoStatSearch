@@ -37,6 +37,7 @@ from scipy.stats import pearsonr, spearmanr, ttest_ind, mannwhitneyu
 from sklearn.linear_model import LinearRegression
 import os
 import argparse
+from itertools import combinations
 
 # Suppress specific warnings
 warnings.filterwarnings('ignore', category=RuntimeWarning)
@@ -150,6 +151,109 @@ def calculate_statistics_per_aa(interface_bonds_file, measure='variance'):
     
     return stats_dict
 
+def perform_statistical_tests_for_binary_property(prop1_data, prop1_name, prop2_data, prop2_name, stats_data, protein_name, measure_name):
+    """
+    Test if binary combination of properties (both high, both low, etc.) correlates with statistic.
+    Returns list of results for different combinations.
+    """
+    results = []
+    
+    # Combine data for both properties
+    combined_data = []
+    for aa in prop1_data.keys():
+        if aa in prop2_data and aa in stats_data and not np.isnan(stats_data[aa]):
+            val1 = prop1_data[aa]
+            val2 = prop2_data[aa]
+            if pd.notna(val1) and pd.notna(val2):
+                combined_data.append({
+                    'Amino_Acid': aa,
+                    'Prop1': val1,
+                    'Prop2': val2,
+                    'Statistic': stats_data[aa]
+                })
+    
+    if len(combined_data) < 3:
+        return []
+    
+    df = pd.DataFrame(combined_data)
+    
+    # Determine high/low thresholds for each property (median split)
+    median1 = df['Prop1'].median()
+    median2 = df['Prop2'].median()
+    
+    # Create binary combinations
+    # 1. Both High
+    both_high = df[(df['Prop1'] >= median1) & (df['Prop2'] >= median2)]['Statistic']
+    other_both_high = df[~((df['Prop1'] >= median1) & (df['Prop2'] >= median2))]['Statistic']
+    
+    # 2. Both Low
+    both_low = df[(df['Prop1'] < median1) & (df['Prop2'] < median2)]['Statistic']
+    other_both_low = df[~((df['Prop1'] < median1) & (df['Prop2'] < median2))]['Statistic']
+    
+    # 3. Prop1 High AND Prop2 Low
+    prop1_high_prop2_low = df[(df['Prop1'] >= median1) & (df['Prop2'] < median2)]['Statistic']
+    other_1h2l = df[~((df['Prop1'] >= median1) & (df['Prop2'] < median2))]['Statistic']
+    
+    # 4. Prop1 Low AND Prop2 High
+    prop1_low_prop2_high = df[(df['Prop1'] < median1) & (df['Prop2'] >= median2)]['Statistic']
+    other_1l2h = df[~((df['Prop1'] < median1) & (df['Prop2'] >= median2))]['Statistic']
+    
+    # Test each combination
+    combinations_to_test = [
+        ('Both High', both_high, other_both_high),
+        ('Both Low', both_low, other_both_low),
+        ('High & Low', prop1_high_prop2_low, other_1h2l),
+        ('Low & High', prop1_low_prop2_high, other_1l2h),
+    ]
+    
+    for combo_name, group1, group2 in combinations_to_test:
+        if len(group1) < 2 or len(group2) < 2:
+            continue
+        
+        if group1.nunique() == 1 and group2.nunique() == 1:
+            continue
+        
+        try:
+            # T-test
+            _, t_p = ttest_ind(group1, group2)
+            # Mann-Whitney U
+            _, u_p = mannwhitneyu(group1, group2, alternative='two-sided')
+            
+            # Calculate effect size (Cohen's d)
+            mean1, mean2 = group1.mean(), group2.mean()
+            std1, std2 = group1.std(), group2.std()
+            pooled_std = np.sqrt((std1**2 + std2**2) / 2)
+            cohens_d = (mean1 - mean2) / pooled_std if pooled_std > 0 else 0
+            
+            # Create a binary indicator for correlation
+            # Use the mean difference as a proxy for correlation direction
+            correlation_proxy = (mean1 - mean2) / (mean1 + mean2) if (mean1 + mean2) > 0 else 0
+            
+            property_name = f"{prop1_name} & {prop2_name}: {combo_name}"
+            
+            results.append({
+                'protein': protein_name,
+                'property': property_name,
+                'measure': measure_name,
+                'n': len(df),
+                'pearson_r': correlation_proxy,  # Using effect size as proxy
+                'pearson_p': t_p,
+                'spearman_rho': np.nan,
+                'spearman_p': np.nan,
+                'high_group_mean': mean1,
+                'low_group_mean': mean2,
+                't_p': t_p,
+                'u_p': u_p,
+                'r_squared': cohens_d**2 / (cohens_d**2 + 4),  # Convert Cohen's d to R² approximation
+                'f_p': t_p,
+                'slope': mean1 - mean2,
+                'intercept': mean2
+            })
+        except:
+            continue
+    
+    return results
+
 def perform_statistical_tests_for_property(property_data, property_name, stats_data, protein_name, measure_name):
     """Perform statistical tests on the relationship between a property and a statistic."""
     combined_data = []
@@ -258,6 +362,11 @@ def main():
         default='mean,variance,std,range,median,iqr,cv,max,min,skewness,kurtosis,p75,p90,p95,outlier_pct',
         help='Comma-separated list of measures to test (default: all)'
     )
+    parser.add_argument(
+        '--include-binary', '-b',
+        action='store_true',
+        help='Include binary combinations of properties (both high, both low, one high one low, etc.)'
+    )
     args = parser.parse_args()
     
     # Parse measures
@@ -279,6 +388,9 @@ def main():
     properties_dict = load_suffix_properties('suffix.csv')
     property_names = list(properties_dict.keys())
     print(f"Loaded {len(property_names)} properties")
+    
+    # Track if we're doing binary combinations
+    do_binary = args.include_binary
     
     # Find files
     pattern = '*_interface_bonds_loss.csv'
@@ -304,6 +416,7 @@ def main():
             if stats_data is None:
                 continue
             
+            # Test single properties
             for property_name in property_names:
                 property_data = properties_dict[property_name]
                 result = perform_statistical_tests_for_property(
@@ -311,6 +424,16 @@ def main():
                 )
                 if result:
                     all_results.append(result)
+            
+            # Test binary combinations if requested
+            if do_binary:
+                for prop1, prop2 in combinations(property_names, 2):
+                    prop1_data = properties_dict[prop1]
+                    prop2_data = properties_dict[prop2]
+                    binary_results = perform_statistical_tests_for_binary_property(
+                        prop1_data, prop1, prop2_data, prop2, stats_data, protein_name, measure
+                    )
+                    all_results.extend(binary_results)
     
     # Summary
     if all_results:
@@ -355,11 +478,16 @@ def main():
         print(f"{'='*85}")
         sig_df = results_df[results_df['pearson_p'] < 0.05].sort_values('pearson_p')
         
+        # Save significant correlations to CSV
         if len(sig_df) > 0:
-            print(f"\n{'Measure':<15} {'Protein':<10} {'Property':<25} {'Pearson r':<12} {'p-value':<12} {'R²':<10}")
-            print("-" * 85)
+            sig_df.to_csv('significant_correlations.csv', index=False)
+            print(f"\nSignificant correlations saved to: significant_correlations.csv")
+        
+        if len(sig_df) > 0:
+            print(f"\n{'Measure':<15} {'Protein':<10} {'Property':<80} {'Pearson r':<12} {'p-value':<12} {'R²':<10}")
+            print("-" * 150)
             for _, row in sig_df.iterrows():
-                print(f"{row['measure']:<15} {row['protein']:<10} {row['property']:<25} "
+                print(f"{row['measure']:<15} {row['protein']:<10} {row['property']:<80} "
                       f"{row['pearson_r']:<12.4f} {row['pearson_p']:<12.6f} {row['r_squared']:<10.4f}")
         else:
             print("\nNo significant correlations found (p < 0.05)")
